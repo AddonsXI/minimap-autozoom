@@ -19,10 +19,13 @@ None.
 
 ## Notes
 
-Any zone you have not set yet starts at a 0.5 zoom level. Each character keeps their own zoom levels.
+Any zone you have not set yet starts at a 0.5 zoom level.
+
+Zoom settings are shared across all characters, since they depend on your monitor rather than your
+character. Set a zone once and it applies to everyone, including new characters. If you're upgrading
+from an older version, your existing character-specific settings will be merged into one shared list
+the first time you load this version.
 
 ## Thanks
 
 To lin, whose minimap-helper is where the idea for this came from.
-
-More addons @ https://github.com/AddonsXI

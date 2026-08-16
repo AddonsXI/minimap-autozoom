@@ -25,12 +25,11 @@
 
 addon.name      = 'minimap-autozoom';
 addon.author    = 'AddonsXI';
-addon.version   = '1.0.0';
+addon.version   = '1.1.0';
 addon.link      = 'https://github.com/AddonsXI';
 addon.desc      = 'Automatically remembers the minimap zoom level you set in each zone';
 
 require('common');
-local settings = require('settings');
 
 local ZONE_PACKET     = 0x0A;
 local WM_MOUSEWHEEL   = 522;
@@ -38,26 +37,30 @@ local IDLE_SAVE_DELAY = 3000;
 local DEFAULT_ZOOM    = '0.5';
 local MIN_ZOOM        = 0.1;
 local POLL_DELAY      = 500;
+local MAX_ZONE        = 9999;
 local HELPER_ADDON    = 'minimap-helper';
+local SHARED_FILE     = 'zones.lua';
 
-local config = settings.load(T{ });
-
+local zones      = { };
+local dirty      = { };
 local currentKey = nil;
-local importDone = false;
 local idleSaveAt = nil;
 local pollAt     = 0;
 
-settings.register('settings', 'settings_update', function (newConfig)
-    if (newConfig ~= nil) then
-        config = newConfig;
-    end
+local function InstallRoot()
+    return AshitaCore:GetInstallPath():gsub('[\\/]+$', '');
+end
 
-    settings.save();
-end);
+local function AddonConfigDir(name)
+    return ('%s\\config\\addons\\%s'):format(InstallRoot(), name);
+end
+
+local function SharedPath()
+    return ('%s\\%s'):format(AddonConfigDir(addon.name), SHARED_FILE);
+end
 
 local function GetMinimapConfigPath()
-    local root = AshitaCore:GetInstallPath():gsub('[\\/]+$', '');
-    return ('%s\\config\\minimap\\minimap.ini'):format(root);
+    return ('%s\\config\\minimap\\minimap.ini'):format(InstallRoot());
 end
 
 local function ReadCurrentZoom()
@@ -88,78 +91,148 @@ local function ReadCurrentZoom()
     return zoom;
 end
 
-local function HelperSettingsPath(name, serverId)
-    local root = AshitaCore:GetInstallPath():gsub('[\\/]+$', '');
-    local base = ('%s\\config\\addons\\%s'):format(root, HELPER_ADDON);
-
-    local direct = ('%s\\%s_%d\\settings.lua'):format(base, name, serverId);
-    if (ashita.fs.exists(direct)) then
-        return direct;
-    end
-
-    local entries = ashita.fs.get_directory(base, '.*');
-    if (entries == nil) then
-        return nil;
-    end
-
-    for _, entry in ipairs(entries) do
-        if (entry:match('^' .. name .. '_%d+$') ~= nil) then
-            local path = ('%s\\%s\\settings.lua'):format(base, entry);
-            if (ashita.fs.exists(path)) then
-                return path;
-            end
-        end
-    end
-
-    return nil;
-end
-
-local function ImportFromHelper()
-    if (importDone) then
-        return;
-    end
-
-    if (next(config) ~= nil) then
-        importDone = true;
-        return;
-    end
-
-    local party = AshitaCore:GetMemoryManager():GetParty();
-    local name = party:GetMemberName(0);
-
-    if (name == nil or name == '') then
-        return;
-    end
-
-    importDone = true;
-
-    local path = HelperSettingsPath(name, party:GetMemberServerId(0));
-    if (path == nil) then
-        return;
-    end
-
+local function ReadZonesFrom(path)
     local file = io.open(path, 'r');
     if (file == nil) then
-        return;
+        return nil, 0;
     end
 
+    local found = { };
     local count = 0;
 
     for line in file:lines() do
         local key, value = line:match('^%s*settings%[(%d+)%]%s*=%s*"([^"]*)"');
+        local id = tonumber(key);
 
-        if (key ~= nil and (tonumber(value) or 0) >= MIN_ZOOM) then
-            config[tonumber(key)] = value;
+        if (id ~= nil and id <= MAX_ZONE and (tonumber(value) or 0) >= MIN_ZOOM) then
+            found[id] = value;
             count = count + 1;
         end
     end
 
     file:close();
+    return found, count;
+end
 
-    if (count > 0) then
-        settings.save();
-        currentKey = nil;
-        print(('[%s] picked up %d saved zones from %s.'):format(addon.name, count, HELPER_ADDON));
+local function WriteZones(path, source)
+    local keys = { };
+    for key in pairs(source) do
+        keys[#keys + 1] = key;
+    end
+    table.sort(keys);
+
+    local file = io.open(path, 'w');
+    if (file == nil) then
+        return false;
+    end
+
+    file:write('require(\'common\');\n\nlocal settings = T{ };\n');
+
+    for _, key in ipairs(keys) do
+        file:write(('settings[%d] = "%s";\n'):format(key, source[key]));
+    end
+
+    file:write('\nreturn settings;\n');
+    file:close();
+    return true;
+end
+
+local function CollectFrom(addonName)
+    local base = AddonConfigDir(addonName);
+    local found = { };
+
+    local entries = ashita.fs.get_directory(base, '.*');
+    if (entries == nil) then
+        return found;
+    end
+
+    for _, entry in ipairs(entries) do
+        if (entry:match('^.+_%d+$') ~= nil) then
+            local saved, count = ReadZonesFrom(('%s\\%s\\settings.lua'):format(base, entry));
+
+            if (saved ~= nil and count > 0) then
+                found[#found + 1] = { zones = saved, count = count };
+            end
+        end
+    end
+
+    return found;
+end
+
+local function Migrate()
+    local shared = SharedPath();
+
+    if (ashita.fs.exists(shared)) then
+        return;
+    end
+
+    local sources = { };
+
+    for _, source in ipairs(CollectFrom(addon.name)) do
+        sources[#sources + 1] = source;
+    end
+
+    for _, source in ipairs(CollectFrom(HELPER_ADDON)) do
+        sources[#sources + 1] = source;
+    end
+
+    table.sort(sources, function(a, b) return a.count < b.count; end);
+
+    local merged = { };
+    local total = 0;
+
+    for _, source in ipairs(sources) do
+        for key, value in pairs(source.zones) do
+            if (merged[key] == nil) then
+                total = total + 1;
+            end
+
+            merged[key] = value;
+        end
+    end
+
+    local dir = AddonConfigDir(addon.name);
+    if (not ashita.fs.exists(dir)) then
+        local partial = '';
+        for segment in dir:gmatch('[^\\]+') do
+            partial = (#partial == 0) and segment or (partial .. '\\' .. segment);
+            ashita.fs.create_directory(partial);
+        end
+    end
+
+    if (WriteZones(shared, merged) and total > 0) then
+        print(('[%s] %d zones are now shared across all your characters.'):format(addon.name, total));
+    end
+end
+
+local function RefreshFromDisk()
+    local disk = ReadZonesFrom(SharedPath());
+
+    if (disk == nil) then
+        return;
+    end
+
+    for key in pairs(dirty) do
+        disk[key] = zones[key];
+    end
+
+    zones = disk;
+end
+
+local function SaveZones()
+    if (next(dirty) == nil) then
+        return;
+    end
+
+    local disk = ReadZonesFrom(SharedPath()) or { };
+
+    for key in pairs(dirty) do
+        disk[key] = zones[key];
+    end
+
+    if (WriteZones(SharedPath(), disk)) then
+        zones = disk;
+        dirty = { };
     end
 end
 
@@ -184,9 +257,10 @@ local function StoreZoom(key)
     end
 
     local value = ('%g'):format(zoom);
-    if (config[key] ~= value) then
-        config[key] = value;
-        settings.save();
+    if (zones[key] ~= value) then
+        zones[key] = value;
+        dirty[key] = true;
+        SaveZones();
     end
 end
 
@@ -195,7 +269,7 @@ local function RestoreZoom(key)
         return;
     end
 
-    local zoom = config[key];
+    local zoom = zones[key];
     if (zoom == nil or (tonumber(zoom) or 0) < MIN_ZOOM) then
         zoom = DEFAULT_ZOOM;
     end
@@ -214,10 +288,14 @@ local function SwitchTo(key)
 
     idleSaveAt = nil;
     currentKey = key;
+
+    RefreshFromDisk();
     RestoreZoom(key);
 end
 
 ashita.events.register('load', 'load_cb', function ()
+    Migrate();
+    RefreshFromDisk();
     SwitchTo(CurrentKey());
 end);
 
@@ -238,7 +316,6 @@ ashita.events.register('d3d_present', 'present_cb', function ()
 
     if (now >= pollAt) then
         pollAt = now + POLL_DELAY;
-        ImportFromHelper();
         SwitchTo(CurrentKey());
     end
 
