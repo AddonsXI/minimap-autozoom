@@ -1,4 +1,4 @@
-# minimap-autozoom
+# minimap-autozoom v1.1.0
 
 Automatically remembers the minimap zoom level you set in each zone.
 
