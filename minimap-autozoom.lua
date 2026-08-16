@@ -35,8 +35,12 @@ local ZONE_PACKET     = 0x0A;
 local WM_MOUSEWHEEL   = 522;
 local IDLE_SAVE_DELAY = 3000;
 local DEFAULT_ZOOM    = '0.5';
+
+-- The Minimap plugin clamps to 0.1, so anything at or under it was never a real zoom..
 local MIN_ZOOM        = 0.1;
 local POLL_DELAY      = 500;
+
+-- Real zone ids stop around 300. Higher keys are leftovers from an older mog house design..
 local MAX_ZONE        = 9999;
 local HELPER_ADDON    = 'minimap-helper';
 local SHARED_FILE     = 'zones.lua';
@@ -63,6 +67,13 @@ local function GetMinimapConfigPath()
     return ('%s\\config\\minimap\\minimap.ini'):format(InstallRoot());
 end
 
+--[[
+* Reads the live zoom out of the Minimap plugin's own ini.
+*
+* The plugin's command list is set only, with no way to ask it for the current
+* value, so the file is the only place the zoom can be read from. It rewrites
+* the ini within about 200ms of every wheel notch, so this is current.
+--]]
 local function ReadCurrentZoom()
     local file = io.open(GetMinimapConfigPath(), 'r');
     if (file == nil) then
@@ -91,6 +102,13 @@ local function ReadCurrentZoom()
     return zoom;
 end
 
+--[[
+* Reads a settings file into a zone table, dropping anything unusable.
+*
+* Both filters matter: a zoom under the plugin's floor does nothing if restored,
+* and a key above MAX_ZONE is dead data from an older design. Filtering on read
+* means an existing file cleans itself up the next time it is written.
+--]]
 local function ReadZonesFrom(path)
     local file = io.open(path, 'r');
     if (file == nil) then
@@ -114,6 +132,12 @@ local function ReadZonesFrom(path)
     return found, count;
 end
 
+--[[
+* Writes a zone table out in the settings library's own format.
+*
+* Nothing loads this through that library any more, but keeping the format means
+* the file stays readable, hand editable, and parseable by the same match above.
+--]]
 local function WriteZones(path, source)
     local keys = { };
     for key in pairs(source) do
@@ -137,6 +161,12 @@ local function WriteZones(path, source)
     return true;
 end
 
+--[[
+* Collects every character's saved zones from one addon's config folder.
+*
+* The name_id pattern is what separates a character folder from the settings
+* library's own 'defaults' folder sitting beside them.
+--]]
 local function CollectFrom(addonName)
     local base = AddonConfigDir(addonName);
     local found = { };
@@ -159,6 +189,14 @@ local function CollectFrom(addonName)
     return found;
 end
 
+--[[
+* Folds every character's old per character file into one shared list.
+*
+* Runs once, on the first load where the shared file is missing. Sources are
+* sorted smallest first so the character with the most saved zones overwrites
+* the others and wins any conflict. The old files are left alone, which also
+* means deleting the shared file re-runs this cleanly.
+--]]
 local function Migrate()
     local shared = SharedPath();
 
@@ -191,6 +229,7 @@ local function Migrate()
         end
     end
 
+    -- Create each segment in turn, since config\addons may not exist on a fresh install..
     local dir = AddonConfigDir(addon.name);
     if (not ashita.fs.exists(dir)) then
         local partial = '';
@@ -200,11 +239,17 @@ local function Migrate()
         end
     end
 
+    -- A new player has nothing to merge, so say nothing at all..
     if (WriteZones(shared, merged) and total > 0) then
         print(('[%s] %d zones are now shared across all your characters.'):format(addon.name, total));
     end
 end
 
+--[[
+* Re-reads the shared file, keeping any zone this session has changed.
+*
+* Picks up zones saved by a second client running alongside this one.
+--]]
 local function RefreshFromDisk()
     local disk = ReadZonesFrom(SharedPath());
 
@@ -219,6 +264,13 @@ local function RefreshFromDisk()
     zones = disk;
 end
 
+--[[
+* Writes changed zones back to the shared file.
+*
+* Merges onto what is on disk rather than overwriting it, and only for keys this
+* session actually touched. Without that, a second client saving after us would
+* lose whatever we had just written, and we would lose whatever it had.
+--]]
 local function SaveZones()
     if (next(dirty) == nil) then
         return;
@@ -239,6 +291,7 @@ end
 local function CurrentKey()
     local zone = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0);
 
+    -- Zone reads 0 mid transition, which is not a place to save anything against..
     if (zone == nil or zone == 0) then
         return nil;
     end
@@ -277,6 +330,12 @@ local function RestoreZoom(key)
     AshitaCore:GetChatManager():QueueCommand(1, ('/minimap zoom %s'):format(zoom));
 end
 
+--[[
+* Banks the zone being left, then applies the zone being entered.
+*
+* Storing before the key changes is what makes a zone change safe to lose the
+* pending idle save to, since the value has already been written by then.
+--]]
 local function SwitchTo(key)
     if (key == nil or key == currentKey) then
         return;
@@ -293,24 +352,43 @@ local function SwitchTo(key)
     RestoreZoom(key);
 end
 
+--[[
+* event: load
+* desc : Event called when the addon is being loaded.
+--]]
 ashita.events.register('load', 'load_cb', function ()
     Migrate();
     RefreshFromDisk();
     SwitchTo(CurrentKey());
 end);
 
+--[[
+* event: packet_in
+* desc : Event called when the client is receiving a packet.
+--]]
 ashita.events.register('packet_in', 'packet_in_cb', function (e)
+    -- Treated as a nudge to poll early rather than parsed, since the party
+    -- memory already carries the zone by the time the next frame runs..
     if (e.id == ZONE_PACKET) then
         pollAt = 0;
     end
 end);
 
+--[[
+* event: mouse
+* desc : Event called when the mouse is being used.
+--]]
 ashita.events.register('mouse', 'mouse_cb', function (e)
+    -- Each notch pushes the deadline back, so a burst of scrolling saves once..
     if (e.message == WM_MOUSEWHEEL) then
         idleSaveAt = ashita.time.get_tick() + IDLE_SAVE_DELAY;
     end
 end);
 
+--[[
+* event: d3d_present
+* desc : Event called when the Direct3D device is presenting a scene.
+--]]
 ashita.events.register('d3d_present', 'present_cb', function ()
     local now = ashita.time.get_tick();
 
@@ -325,6 +403,11 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     end
 end);
 
+--[[
+* event: unload
+* desc : Event called when the addon is being unloaded.
+--]]
 ashita.events.register('unload', 'unload_cb', function ()
+    -- Catches a zoom set and never zoned away from..
     StoreZoom(currentKey);
 end);
