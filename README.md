@@ -23,3 +23,5 @@ Zoom settings are shared across all characters. Set a zone once and it applies t
 ## Thanks
 
 To lin, whose minimap-helper is where the idea for this came from.
+
+More addons @ https://github.com/AddonsXI
